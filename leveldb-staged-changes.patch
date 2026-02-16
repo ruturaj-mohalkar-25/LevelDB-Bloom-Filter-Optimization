@@ -1,0 +1,396 @@
+diff --git a/benchmarks/db_bench.cc b/benchmarks/db_bench.cc
+index 8e3f4e7..49d7a6a 100644
+--- a/benchmarks/db_bench.cc
++++ b/benchmarks/db_bench.cc
+@@ -48,6 +48,8 @@ static const char* FLAGS_benchmarks =
+     "fillseq,"
+     "fillsync,"
+     "fillrandom,"
++    "random50dup,"
++    "writerandomdup,"
+     "overwrite,"
+     "readrandom,"
+     "readrandom,"  // Extra run to allow previous compactions to quiesce
+@@ -129,6 +131,9 @@ static const char* FLAGS_db = nullptr;
+ // ZSTD compression level to try out
+ static int FLAGS_zstd_compression_level = 1;
+ 
++static int FLAGS_dup_percent = 50;
++
++
+ namespace leveldb {
+ 
+ namespace {
+@@ -590,6 +595,12 @@ class Benchmark {
+       } else if (name == Slice("fillrandom")) {
+         fresh_db = true;
+         method = &Benchmark::WriteRandom;
++      } else if (name == Slice("random50dup")) {
++        fresh_db = true;
++        method = &Benchmark::WriteRandom50Dup;
++      } else if (name == Slice("writerandomdup")) {
++        fresh_db = true;
++        method = &Benchmark::WriteRandomDup;
+       } else if (name == Slice("overwrite")) {
+         fresh_db = false;
+         method = &Benchmark::WriteRandom;
+@@ -816,6 +827,14 @@ class Benchmark {
+     options.reuse_logs = FLAGS_reuse_logs;
+     options.compression =
+         FLAGS_compression ? kSnappyCompression : kNoCompression;
++
++    // options.duplicate_check_mode = leveldb::kNoDuplicateCheck;
++    // options.duplicate_check_mode = leveldb::kAlwaysGetDuplicateCheck;
++    options.duplicate_check_mode = leveldb::kBloomFilterDuplicateCheck;
++
++    options.write_bloom_bits_per_key = 10;
++    options.write_bloom_capacity = 1000000;
++
+     Status s = DB::Open(options, FLAGS_db, &db_);
+     if (!s.ok()) {
+       std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
+@@ -865,6 +884,98 @@ class Benchmark {
+     thread->stats.AddBytes(bytes);
+   }
+ 
++    void WriteRandom50Dup(ThreadState* thread) {
++    // Similar to DoWrite(..., seq=false), but restrict key space to create duplicates.
++    if (num_ != FLAGS_num) {
++      char msg[100];
++      std::snprintf(msg, sizeof(msg), "(%d ops)", num_);
++      thread->stats.AddMessage(msg);
++    }
++
++    RandomGenerator gen;
++    WriteBatch batch;
++    Status s;
++    int64_t bytes = 0;
++    KeyBuffer key;
++
++    // We only use num_/2 distinct keys, so as we do num_ writes,
++    // many of them will overwrite existing keys (≈ 50% duplicates).
++    const int key_range = num_ / 2;
++    if (key_range <= 0) {
++      std::fprintf(stderr, "random50dup: key_range <= 0 (num_ too small)\n");
++      std::exit(1);
++    }
++
++    for (int i = 0; i < num_; i += entries_per_batch_) {
++      batch.Clear();
++      for (int j = 0; j < entries_per_batch_; j++) {
++        const int k = thread->rand.Uniform(key_range);
++        key.Set(k);
++        batch.Put(key.slice(), gen.Generate(value_size_));
++        bytes += value_size_ + key.slice().size();
++        thread->stats.FinishedSingleOp();
++      }
++      s = db_->Write(write_options_, &batch);
++      if (!s.ok()) {
++        std::fprintf(stderr, "random50dup: put error: %s\n", s.ToString().c_str());
++        std::exit(1);
++      }
++    }
++
++    thread->stats.AddBytes(bytes);
++  }
++
++  void WriteRandomDup(ThreadState* thread) {
++  if (num_ != FLAGS_num) {
++    char msg[100];
++    std::snprintf(msg, sizeof(msg), "(%d ops)", num_);
++    thread->stats.AddMessage(msg);
++  }
++
++  RandomGenerator gen;
++  WriteBatch batch;
++  Status s;
++  int64_t bytes = 0;
++  KeyBuffer key;
++
++  // Compute key_range from target duplicate percentage
++  int dup = FLAGS_dup_percent;
++  if (dup < 0) dup = 0;
++  if (dup > 100) dup = 100;
++
++  // D = dup / 100.0, key_range ≈ (1 - D) * num_
++  double dup_ratio = dup / 100.0;
++  int key_range = static_cast<int>(num_ * (1.0 - dup_ratio));
++
++  // Avoid key_range <= 0 when dup is 100 percent
++  if (key_range <= 0) key_range = 1;
++
++  if (key_range <= 0) {
++    std::fprintf(stderr, "writerandomdup: key_range <= 0 (num_ too small)\n");
++    std::exit(1);
++  }
++
++  for (int i = 0; i < num_; i += entries_per_batch_) {
++    batch.Clear();
++    for (int j = 0; j < entries_per_batch_ && i + j < num_; j++) {
++      const int k = thread->rand.Uniform(key_range);
++      key.Set(k);
++      batch.Put(key.slice(), gen.Generate(value_size_));
++      bytes += value_size_ + key.slice().size();
++      thread->stats.FinishedSingleOp();
++    }
++
++    s = db_->Write(write_options_, &batch);
++    if (!s.ok()) {
++      std::fprintf(stderr, "writerandomdup: put error: %s\n", s.ToString().c_str());
++      std::exit(1);
++    }
++  }
++
++  thread->stats.AddBytes(bytes);
++}
++
++
+   void ReadSequential(ThreadState* thread) {
+     Iterator* iter = db_->NewIterator(ReadOptions());
+     int i = 0;
+@@ -1117,7 +1228,10 @@ int main(int argc, char** argv) {
+       FLAGS_open_files = n;
+     } else if (strncmp(argv[i], "--db=", 5) == 0) {
+       FLAGS_db = argv[i] + 5;
+-    } else {
++    } else if (sscanf(argv[i], "--dup_percent=%d%c", &n, &junk) == 1 &&
++           (n >= 0 && n <= 100)) {
++  FLAGS_dup_percent = n;
++    }  else {
+       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
+       std::exit(1);
+     }
+diff --git a/db/db_impl.cc b/db/db_impl.cc
+index f96d245..cac6a4a 100644
+--- a/db/db_impl.cc
++++ b/db/db_impl.cc
+@@ -147,7 +147,14 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+       background_compaction_scheduled_(false),
+       manual_compaction_(nullptr),
+       versions_(new VersionSet(dbname_, &options_, table_cache_,
+-                               &internal_comparator_)) {}
++                               &internal_comparator_)) {
++
++    if (options_.duplicate_check_mode == kBloomFilterDuplicateCheck) {
++    write_bloom_.reset(new WritePathBloomFilter(
++        options_.write_bloom_capacity,
++        options_.write_bloom_bits_per_key));
++  }
++}
+ 
+ DBImpl::~DBImpl() {
+   // Wait for background work to finish.
+@@ -1203,6 +1210,13 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+ }
+ 
+ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
++
++      // Perform optional duplicate detection before we actually write.
++  Status s = HandleDuplicateDetection(updates);
++  if (!s.ok()) {
++    return s;
++  }
++
+   Writer w(&mutex_);
+   w.batch = updates;
+   w.sync = options.sync;
+@@ -1217,6 +1231,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+     return w.status;
+   }
+ 
++
++
++
+   // May temporarily unlock and wait.
+   Status status = MakeRoomForWrite(updates == nullptr);
+   uint64_t last_sequence = versions_->LastSequence();
+@@ -1483,6 +1500,54 @@ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
+   v->Unref();
+ }
+ 
++
++Status DBImpl::HandleDuplicateDetection(WriteBatch* updates) {
++  if (options_.duplicate_check_mode == kNoDuplicateCheck) {
++    return Status::OK();
++  }
++
++  class DuplicateCheckHandler : public WriteBatch::Handler {
++   public:
++    explicit DuplicateCheckHandler(DBImpl* db) : db_(db) {}
++
++    void Put(const Slice& key, const Slice& value) override {
++      db_->HandleSinglePutForDuplicateCheck(key);
++    }
++    void Delete(const Slice& key) override {
++      
++    }
++
++   private:
++    DBImpl* db_;
++  };
++
++  DuplicateCheckHandler handler(this);
++  return updates->Iterate(&handler);
++}
++
++void DBImpl::HandleSinglePutForDuplicateCheck(const Slice& key) {
++  switch (options_.duplicate_check_mode) {
++    case kAlwaysGetDuplicateCheck: {
++      std::string value;
++      Get(ReadOptions(), key, &value);
++      break;
++    }
++    case kBloomFilterDuplicateCheck: {
++      if (write_bloom_) {
++        if (write_bloom_->MaybeContains(key)) {
++          std::string value;
++          Get(ReadOptions(), key, &value);
++        }
++        write_bloom_->Add(key);
++      }
++      break;
++    }
++    case kNoDuplicateCheck:
++    default:
++      break;
++  }
++}
++
+ // Default implementations of convenience methods that subclasses of DB
+ // can call if they wish
+ Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
+diff --git a/db/db_impl.h b/db/db_impl.h
+index c7b0172..328f672 100644
+--- a/db/db_impl.h
++++ b/db/db_impl.h
+@@ -18,6 +18,9 @@
+ #include "port/port.h"
+ #include "port/thread_annotations.h"
+ 
++#include "db/wp_bloom.h"
++
++
+ namespace leveldb {
+ 
+ class MemTable;
+@@ -203,6 +206,13 @@ class DBImpl : public DB {
+   Status bg_error_ GUARDED_BY(mutex_);
+ 
+   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
++
++  // Write path Bloom filter used when duplicate_check_mode is BloomFilter.
++  std::unique_ptr<WritePathBloomFilter> write_bloom_;
++  
++  Status HandleDuplicateDetection(WriteBatch* updates);
++  void HandleSinglePutForDuplicateCheck(const Slice& key);
++
+ };
+ 
+ // Sanitize db options.  The caller should delete result.info_log if
+diff --git a/db/wp_bloom.h b/db/wp_bloom.h
+new file mode 100644
+index 0000000..c905633
+--- /dev/null
++++ b/db/wp_bloom.h
+@@ -0,0 +1,69 @@
++#ifndef LEVELDB_WP_BLOOM_H_
++#define LEVELDB_WP_BLOOM_H_
++
++#include <vector>
++#include "leveldb/slice.h"
++#include "util/hash.h"
++
++namespace leveldb {
++
++class WritePathBloomFilter {
++ public:
++  WritePathBloomFilter(size_t capacity, int bits_per_key)
++      : capacity_(capacity),
++        bits_per_key_(bits_per_key) {
++    if (capacity_ == 0 || bits_per_key_ <= 0) {
++      bits_ = 0;
++      k_ = 0;
++      return;
++    }
++
++    size_t bits = capacity_ * static_cast<size_t>(bits_per_key_);
++    k_ = static_cast<size_t>(bits_per_key_ * 0.69);
++    if (k_ < 1) k_ = 1;
++    if (k_ > 30) k_ = 30;
++
++    bits_ = bits;
++    data_.resize((bits + 7) / 8, 0);
++  }
++
++  bool MaybeContains(const Slice& key) const {
++    if (bits_ == 0) return false;
++
++    uint32_t h = Hash(key.data(), key.size(), 0xbc9f1d34);
++    uint32_t delta = (h >> 17) | (h << 15);
++
++    for (size_t j = 0; j < k_; j++) {
++      uint32_t bitpos = h % bits_;
++      if ((data_[bitpos / 8] & (1 << (bitpos % 8))) == 0) {
++        return false;
++      }
++      h += delta;
++    }
++    return true;
++  }
++
++  void Add(const Slice& key) {
++    if (bits_ == 0) return;
++
++    uint32_t h = Hash(key.data(), key.size(), 0xbc9f1d34);
++    uint32_t delta = (h >> 17) | (h << 15);
++
++    for (size_t j = 0; j < k_; j++) {
++      uint32_t bitpos = h % bits_;
++      data_[bitpos / 8] |= (1 << (bitpos % 8));
++      h += delta;
++    }
++  }
++
++ private:
++  size_t capacity_;
++  int bits_per_key_;
++  size_t bits_;
++  size_t k_;
++  std::vector<unsigned char> data_;
++};
++
++}
++
++#endif
+diff --git a/include/leveldb/options.h b/include/leveldb/options.h
+index d755f46..b2331dd 100644
+--- a/include/leveldb/options.h
++++ b/include/leveldb/options.h
+@@ -30,6 +30,12 @@ enum CompressionType {
+   kZstdCompression = 0x2,
+ };
+ 
++enum DuplicateCheckMode {
++  kNoDuplicateCheck = 0,
++  kAlwaysGetDuplicateCheck = 1,
++  kBloomFilterDuplicateCheck = 2
++};
++
+ // Options to control the behavior of a database (passed to DB::Open)
+ struct LEVELDB_EXPORT Options {
+   // Create an Options object with default values for all fields.
+@@ -145,6 +151,14 @@ struct LEVELDB_EXPORT Options {
+   // Many applications will benefit from passing the result of
+   // NewBloomFilterPolicy() here.
+   const FilterPolicy* filter_policy = nullptr;
++
++  //Duplicate detection for writes.
++  DuplicateCheckMode duplicate_check_mode = kNoDuplicateCheck;
++
++  // Bloom filter parameters for write path.
++  int write_bloom_bits_per_key = 10;
++  size_t write_bloom_capacity = 1000000;
++
+ };
+ 
+ // Options that control read operations
